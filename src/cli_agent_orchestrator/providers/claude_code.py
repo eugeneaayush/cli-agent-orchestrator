@@ -346,6 +346,36 @@ class ClaudeCodeProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+    @staticmethod
+    def _resolve_config_dir(profile: Optional["AgentProfile"]) -> Optional[Path]:
+        """Return the profile's ``claudeConfig.configDir`` as a validated path.
+
+        The directory becomes ``CLAUDE_CONFIG_DIR`` for this terminal, giving the
+        worker its own settings, ``.claude.json`` and Keychain credential entry
+        (e.g. a second account, or an Anthropic-compatible backend authenticated
+        by an ``apiKeyHelper`` in that directory's settings.json).
+
+        Fails closed: a configured-but-unusable directory raises ProviderError
+        instead of silently launching against the default ``~/.claude`` -- which
+        holds the user's own login and would bill/authenticate the wrong account.
+        """
+        claude_config = getattr(profile, "claudeConfig", None) if profile is not None else None
+        if not isinstance(claude_config, dict) or "configDir" not in claude_config:
+            return None
+        raw = claude_config["configDir"]
+        if not isinstance(raw, str) or not raw.strip():
+            raise ProviderError("claudeConfig.configDir must be a non-empty path string")
+        config_dir = Path(raw).expanduser()
+        if not config_dir.is_absolute():
+            raise ProviderError(
+                f"claudeConfig.configDir must be an absolute path (or start with ~): {raw!r}"
+            )
+        if not config_dir.is_dir():
+            raise ProviderError(
+                f"claudeConfig.configDir does not exist or is not a directory: {config_dir}"
+            )
+        return config_dir
+
     def _build_claude_command(self, profile: Optional["AgentProfile"] = _UNSET) -> str:
         """Build Claude Code command with agent profile if provided.
 
@@ -372,6 +402,11 @@ class ClaudeCodeProvider(BaseProvider):
 
         if profile is _UNSET:
             profile = self._load_profile()
+
+        # Resolved (and validated) up front so an unusable configDir fails the
+        # launch before anything is built. Applies to every route that loaded a
+        # profile, including native_agent (agents then resolve in that dir).
+        config_dir = self._resolve_config_dir(profile)
 
         # Determine permission mode for the base command.
         # Priority: explicit permissionMode > yolo/root detection > default yolo.
@@ -521,6 +556,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Unset all matching vars except CLAUDE_CODE_USE_*,
         # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
         # Bedrock, Vertex AI, Foundry), and CLAUDE_CODE_EFFORT_LEVEL (user pref).
+        # This unset is also load-bearing for credential isolation: a leaked
+        # CLAUDE_CODE_ENTRYPOINT (e.g. from a Claude Desktop-spawned shell) makes
+        # Claude Code ignore settings-based credentials and prefer the launch env.
         unset_cmd = (
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
             " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
@@ -528,10 +566,17 @@ class ClaudeCodeProvider(BaseProvider):
             "|CLAUDE_CODE_EFFORT_LEVEL'"
             ") 2>/dev/null"
         )
-        return f"{unset_cmd}; {claude_cmd}"
+        # claudeConfig.configDir: set CLAUDE_CONFIG_DIR for this process only,
+        # AFTER the unset above (which would otherwise strip it). A path, never a
+        # secret, so it is safe on the typed launch line.
+        env_prefix = ""
+        if config_dir is not None:
+            guest_dir = self._translate_path(str(config_dir), profile)
+            env_prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(guest_dir)} "
+        return f"{unset_cmd}; {env_prefix}{claude_cmd}"
 
     @staticmethod
-    def _ensure_skip_bypass_prompt_setting() -> None:
+    def _ensure_skip_bypass_prompt_setting(settings_path: Optional[Path] = None) -> None:
         """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
 
         Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
@@ -540,6 +585,10 @@ class ClaudeCodeProvider(BaseProvider):
         ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
         so the confirmation is redundant and blocks initialization.
 
+        ``settings_path`` defaults to ``~/.claude/settings.json``; a profile
+        with ``claudeConfig.configDir`` passes ``<configDir>/settings.json`` so
+        that worker's launch never rewrites the user's own settings file.
+
         After the async conversion, N concurrent inits may run this
         read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
         our own threads (in-process only: a second cao-server process, or
@@ -547,7 +596,8 @@ class ClaudeCodeProvider(BaseProvider):
         still a last-writer-wins lost update); ``os.replace`` only guarantees
         no torn reads for anything outside CAO.
         """
-        settings_path = Path.home() / ".claude" / "settings.json"
+        if settings_path is None:
+            settings_path = Path.home() / ".claude" / "settings.json"
         with _SETTINGS_WRITE_LOCK:
             settings: dict = {}
             existing_mode: Optional[int] = None
@@ -584,7 +634,7 @@ class ClaudeCodeProvider(BaseProvider):
                 # the tmp file indefinitely.
                 tmp_path.unlink(missing_ok=True)
                 raise
-        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+        logger.info("Set skipDangerousModePermissionPrompt in %s", settings_path)
 
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
@@ -819,6 +869,11 @@ class ClaudeCodeProvider(BaseProvider):
         profile = self._load_profile()
         init_timeout = self.get_init_timeout(profile)
 
+        # Validate claudeConfig.configDir before touching the pane, so an
+        # unusable directory fails the launch before anything runs.
+        config_dir = self._resolve_config_dir(profile)
+        settings_path = config_dir / "settings.json" if config_dir is not None else None
+
         # Wait for shell prompt to appear in the tmux window
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
@@ -830,7 +885,8 @@ class ClaudeCodeProvider(BaseProvider):
         # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
         # and _build_claude_command's temp-file I/O above/below are still
         # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
-        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
+        # A claudeConfig.configDir worker gets the setting in its own directory.
+        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting, settings_path)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)

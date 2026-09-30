@@ -79,17 +79,23 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 1. Loads the profile from the agent store
 2. Extracts the system prompt from the Markdown content
-3. Passes it via `--append-system-prompt` (newlines escaped to `\n` for tmux compatibility)
-4. Injects MCP servers via `--mcp-config` JSON if the profile defines `mcpServers`
+3. Writes it to a `0600` temp file under `~/.aws/cli-agent-orchestrator/tmp/` and passes it via `--append-system-prompt-file`
+4. Injects MCP servers via `--mcp-config <file> --strict-mcp-config` if the profile defines `mcpServers`
 
 ### Launch Command
 
 The provider builds the command via `_build_claude_command()`:
 
 ```
-claude --dangerously-skip-permissions [--append-system-prompt "..."] [--mcp-config "..."]
-claude --permission-mode auto [--append-system-prompt "..."] [--mcp-config "..."]
+unset <CLAUDE* vars>; [CLAUDE_CONFIG_DIR=<dir>] claude --dangerously-skip-permissions [--model …] [--append-system-prompt-file <file>] [--mcp-config <file> --strict-mcp-config]
+unset <CLAUDE* vars>; [CLAUDE_CONFIG_DIR=<dir>] claude --permission-mode auto […]
 ```
+
+The leading `unset` removes `CLAUDE*` variables the pane may have inherited from the tmux server's
+global environment (for example `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` when `cao-server` was started
+from inside a Claude Code session), keeping only the Bedrock/Vertex/Foundry auth flags and
+`CLAUDE_CODE_EFFORT_LEVEL`. `CLAUDE_CONFIG_DIR` is set after it; see
+[Per-Agent Config Directory](#per-agent-config-directory).
 
 ### Permission Mode Override
 
@@ -112,6 +118,60 @@ permissionMode: auto
 
 You review code for quality and correctness.
 ```
+
+### Per-Agent Config Directory
+
+`claudeConfig.configDir` runs an agent with its own Claude Code configuration directory. CAO launches
+it as `CLAUDE_CONFIG_DIR=<dir> claude …`, so that agent reads `<dir>/settings.json` and
+`<dir>/.claude.json`, keeps its own session history, and looks up its own Keychain credential entry,
+independent of your `~/.claude`.
+
+Use it when a worker must run as a different identity or backend than you do, for example:
+
+- a second Claude account, logged in once with `CLAUDE_CONFIG_DIR=<dir> claude` and `/login`
+- an Anthropic-compatible backend, configured in `<dir>/settings.json` with `ANTHROPIC_BASE_URL`,
+  model aliases and an `apiKeyHelper` that reads the key from a secret store
+
+```markdown
+---
+name: glm-developer
+description: Developer worker on an Anthropic-compatible backend
+provider: claude_code
+model: opus
+claudeConfig:
+  configDir: ~/.claude-glm
+---
+
+You implement the task you are given.
+```
+
+Behavior:
+
+- **Fails closed.** The value must be an existing directory and an absolute path (`~` is expanded).
+  Otherwise the launch fails with a provider error. It never falls back to `~/.claude`, which holds
+  your own login.
+- **Scoped to the agent process.** The variable is set on the launch line after the `unset`, so it is
+  not forwarded through the tmux session environment. Children of the agent (its shell commands, or a
+  nested `claude`) inherit it and stay on the same directory.
+- **Applies to every route with a CAO profile**, including `native_agent` (the agent is then looked up
+  in `<dir>/agents/`).
+- CAO writes `skipDangerousModePermissionPrompt` into `<dir>/settings.json` instead of
+  `~/.claude/settings.json` for these agents.
+- A fresh directory has no onboarding state. Create `<dir>/.claude.json` containing
+  `{"hasCompletedOnboarding": true}` (or run `CLAUDE_CONFIG_DIR=<dir> claude` once interactively) so
+  the first-run screens do not block the tmux pane.
+
+Why a directory rather than environment variables? Claude Code falls back to your own saved login
+whenever the directory's settings do not configure a credential. With a separate directory there is
+no saved login to fall back to, so a misconfigured worker fails with "not logged in" instead of
+sending your credentials to another endpoint.
+
+Never put secrets, or `${VAR}` placeholders that resolve to secrets, in agent profiles. Profiles are
+returned resolved by `GET /agents/profiles/{name}`. Keep credentials in the directory's
+`apiKeyHelper` (for example a `security find-generic-password … -w` command on macOS) or in its own
+login.
+
+See [examples/zai-glm-workers](../examples/zai-glm-workers/README.md) for a complete setup.
 
 ## Eager Inbox Delivery
 

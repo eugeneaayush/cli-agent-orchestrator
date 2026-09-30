@@ -7,7 +7,10 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
@@ -867,6 +870,31 @@ class CodexProvider(BaseProvider):
         """
         return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
 
+    @staticmethod
+    def _resolve_codex_home(profile: Optional["AgentProfile"]) -> Optional[Path]:
+        """Return the profile's ``codexHome`` as a validated path, or None.
+
+        The directory becomes ``CODEX_HOME`` for this terminal's codex process:
+        its own config.toml (model provider, model, MCP servers), auth and
+        sessions, independent of the user's ~/.codex. Fails closed -- a
+        configured-but-unusable directory raises ProviderError instead of
+        silently launching against ~/.codex, whose config and login belong to
+        the user's own Codex setup.
+        """
+        raw = getattr(profile, "codexHome", None) if profile is not None else None
+        # AgentProfile types this Optional[str] (min_length=1), so anything else
+        # can only be an unvalidated stand-in object; treat it as unset.
+        if not isinstance(raw, str):
+            return None
+        if not raw.strip():
+            raise ProviderError("codexHome must be a non-empty path string")
+        codex_home = Path(raw).expanduser()
+        if not codex_home.is_absolute():
+            raise ProviderError(f"codexHome must be an absolute path (or start with ~): {raw!r}")
+        if not codex_home.is_dir():
+            raise ProviderError(f"codexHome does not exist or is not a directory: {codex_home}")
+        return codex_home
+
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -876,8 +904,9 @@ class CodexProvider(BaseProvider):
         # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
         # is the default because CAO runs codex non-interactively in tmux
         # where approval prompts would block handoff/assign. Profiles can
-        # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # opt out via `codexProfile` (a Codex config profile, read by Codex
+        # 0.134+ from $CODEX_HOME/<name>.config.toml), unless unrestricted
+        # allowed tools are enabled.
         # In practice, allowed_tools containing "*" is treated as yolo mode
         # and overrides codexProfile in the same way as an explicit yolo launch.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
@@ -888,6 +917,10 @@ class CodexProvider(BaseProvider):
                 profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        # Validated before anything else is built so an unusable codexHome fails
+        # the launch instead of falling back to ~/.codex.
+        codex_home = self._resolve_codex_home(profile)
 
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
@@ -919,7 +952,7 @@ class CodexProvider(BaseProvider):
                     "settings in ~/.codex/config.toml, including "
                     "[sandbox_workspace_write].network_access, do NOT apply. Set "
                     "codexProfile on the agent profile to launch under a named "
-                    "[profiles.<name>] block instead.",
+                    "Codex config profile instead.",
                     self.terminal_id,
                 )
             command_parts = ["codex", "--yolo"]
@@ -1116,6 +1149,11 @@ class CodexProvider(BaseProvider):
         command = shlex.join(command_parts)
         if developer_instructions_fragment is not None:
             command = f"{command} {developer_instructions_fragment}"
+        if codex_home is not None:
+            # Scoped to this one codex process via a command-prefix assignment
+            # (CODEX_* keys are deliberately not forwardable through tmux env).
+            # A path, never a secret, so it is safe on the typed launch line.
+            command = f"CODEX_HOME={shlex.quote(str(codex_home))} {command}"
         return command
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:

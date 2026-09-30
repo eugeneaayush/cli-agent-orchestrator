@@ -9,12 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-agent CLI config homes: `claudeConfig.configDir` launches a `claude_code`
+  agent with `CLAUDE_CONFIG_DIR=<dir>`, and the new `codexHome` profile field
+  launches a `codex` agent with `CODEX_HOME=<dir>`. Workers can run under a
+  different account or model backend (for example Z.ai GLM behind the desktop
+  apps' own subscriptions) without touching `~/.claude` / `~/.codex`. Both fail
+  closed on a missing or relative path instead of falling back to the user's
+  own home. New example: `examples/zai-glm-workers`.
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
   surfacing bounded findings and the truncation-marker contract (#510)
 
 ### Fixed
+
+- Docs: `codexProfile` now documents Codex 0.134+ semantics
+  (`$CODEX_HOME/<name>.config.toml`; the legacy `[profiles.<name>]` table is
+  rejected), the Claude Code launch command reflects
+  `--append-system-prompt-file`, and `docs/tmux.md` notes that panes inherit the
+  tmux server's global environment.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

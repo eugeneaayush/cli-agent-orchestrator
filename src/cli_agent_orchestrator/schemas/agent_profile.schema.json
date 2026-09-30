@@ -90,6 +90,11 @@
       "type": "string",
       "minLength": 1
     },
+    "codexHome": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Codex only. Existing absolute directory (~ expanded) used as CODEX_HOME for this agent's codex process."
+    },
     "codexConfig": {
       "type": "object"
     },
