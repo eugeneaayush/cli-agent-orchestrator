@@ -100,9 +100,9 @@ dependencies = [
     # Markdown parser used by the repository-local link validator.
     "markdown-it-py>=4.0.0",
     # `cao update` reads uv's install receipt (TOML). tomllib is stdlib on 3.11+;
-    # on 3.10 the fallback `import tomli` runs. cli/main.py imports the update
-    # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
-    # not just a dev dependency — or every `cao` command would fail to import.
+    # on 3.10 the fallback `import tomli` runs when the update command loads, so
+    # tomli must be a RUNTIME dependency on 3.10 — not just a dev dependency — or
+    # `cao update` would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
     "psutil>=7.0.0",
 ]

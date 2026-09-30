@@ -1,30 +1,17 @@
-"""Main CLI entry point for CLI Agent Orchestrator."""
+"""Main CLI entry point for CLI Agent Orchestrator.
+
+Keep this module cheap to import. Every ``cao`` invocation imports it, and so does every
+shell-completion request, which zsh-autocomplete sends as you type. Subcommands are
+registered in ``_COMMANDS`` below and their modules are imported only when that command is
+used; see ``cli/lazy_group.py``. ``test/cli/test_cli_startup.py`` fails if importing this
+module, ``cao --help`` or ``cao <Tab>`` pulls in a command module or a heavy dependency.
+"""
 
 from importlib.metadata import PackageNotFoundError, version
 
 import click
 
-from cli_agent_orchestrator.cli.commands.agent import agent
-from cli_agent_orchestrator.cli.commands.agent_plugin import agent_plugin
-from cli_agent_orchestrator.cli.commands.config import config
-from cli_agent_orchestrator.cli.commands.env import env
-from cli_agent_orchestrator.cli.commands.fleet import fleet
-from cli_agent_orchestrator.cli.commands.info import info
-from cli_agent_orchestrator.cli.commands.init import init
-from cli_agent_orchestrator.cli.commands.install import install
-from cli_agent_orchestrator.cli.commands.launch import launch
-from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
-from cli_agent_orchestrator.cli.commands.memory import memory
-from cli_agent_orchestrator.cli.commands.profile import profile
-from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
-from cli_agent_orchestrator.cli.commands.session import session
-from cli_agent_orchestrator.cli.commands.shutdown import shutdown
-from cli_agent_orchestrator.cli.commands.skills import skills
-from cli_agent_orchestrator.cli.commands.terminal import terminal
-from cli_agent_orchestrator.cli.commands.tui import tui
-from cli_agent_orchestrator.cli.commands.update import update
-from cli_agent_orchestrator.cli.commands.worker import worker
-from cli_agent_orchestrator.cli.commands.workflow import workflow
+from cli_agent_orchestrator.cli.lazy_group import LazyCommand, LazyGroup
 
 try:
     __version__ = version("cli-agent-orchestrator")
@@ -32,40 +19,64 @@ except PackageNotFoundError:
     __version__ = "unknown"
 
 
-@click.group()
+def _lazy(module: str, attribute: str, help: str, hidden: bool = False) -> LazyCommand:
+    return LazyCommand(f"cli_agent_orchestrator.cli.commands.{module}:{attribute}", help, hidden)
+
+
+# Register commands: name -> (module in cli/commands/, command object, help line, hidden).
+# The help line and hidden flag are what `cao --help` and shell completion show without
+# importing the module, so they must match the command's docstring and decorator. The
+# placeholder test in test/cli/test_cli_startup.py fails if they drift.
+_COMMANDS = {
+    "agent": _lazy("agent", "agent", "Orchestrate other agents from the shell."),
+    "profile": _lazy("profile", "profile", "Manage agent profiles."),
+    "launch": _lazy("launch", "launch", "Launch cao session with specified agent profile."),
+    "config": _lazy(
+        "config", "config", "Inspect and edit unified CAO configuration (settings.json)."
+    ),
+    "init": _lazy("init", "init", "Initialize CLI Agent Orchestrator database."),
+    "install": _lazy(
+        "install",
+        "install",
+        "Install an agent from local store, built-in store, URL, or file path.",
+    ),
+    "shutdown": _lazy(
+        "shutdown", "shutdown", "Shutdown tmux sessions and cleanup terminal records."
+    ),
+    "schedule": _lazy("schedule", "schedule", "Manage scheduled agent flows."),
+    # deprecated alias for 'schedule' (issue #378)
+    "flow": _lazy("schedule", "flow", "[Deprecated] Alias for 'cao schedule'.", hidden=True),
+    "env": _lazy("env", "env", "Manage CAO environment variables."),
+    "mcp-server": _lazy("mcp_server", "mcp_server", "Start the CAO MCP server."),
+    "info": _lazy("info", "info", "Display information about the current session."),
+    "memory": _lazy("memory", "memory", "Manage CAO memories."),
+    "skills": _lazy("skills", "skills", "Manage installed skills."),
+    # Agent Plugins 1.0.0 (docs/agent-plugins.md). Distinct from the event-plugin
+    # system in plugins/. The verb itself is maintainer decision M1 — see the
+    # module docstring; changing it is a one-line edit here.
+    "plugin": _lazy(
+        "agent_plugin",
+        "agent_plugin",
+        "Manage agent plugins (Agent Plugins 1.0.0).",
+        hidden=True,
+    ),
+    "session": _lazy("session", "session", "Manage CAO sessions."),
+    "terminal": _lazy("terminal", "terminal", "Manage CAO terminals."),
+    # Remote fleets. `cao fleet`/`cao worker` reach a cluster's worker broker over
+    # HTTP; every other command here talks to the cao-server on this machine.
+    "fleet": _lazy("fleet", "fleet", "Inspect and tear down a CAO fleet's workers."),
+    "worker": _lazy("worker", "worker", "Inspect and talk to workers in a CAO cluster."),
+    "workflow": _lazy("workflow", "workflow", "Author and inspect CAO workflow specs."),
+    "update": _lazy("update", "update", "Update CAO to the latest version."),
+    # bundled Rust terminal UI (issue #321)
+    "tui": _lazy("tui", "tui", "Launch the terminal UI (bundled Rust binary)."),
+}
+
+
+@click.group(cls=LazyGroup, lazy_commands=_COMMANDS)
 @click.version_option(__version__, "-V", "--version", prog_name="cao")
 def cli():
     """CLI Agent Orchestrator."""
-
-
-# Register commands
-cli.add_command(agent)
-cli.add_command(profile)
-cli.add_command(launch)
-cli.add_command(config)
-cli.add_command(init)
-cli.add_command(install)
-cli.add_command(shutdown)
-cli.add_command(schedule)
-cli.add_command(flow)  # deprecated alias for 'schedule' (issue #378)
-cli.add_command(env)
-cli.add_command(mcp_server)
-cli.add_command(info)
-cli.add_command(memory)
-cli.add_command(skills)
-# Agent Plugins 1.0.0 (docs/agent-plugins.md). Distinct from the event-plugin
-# system in plugins/. The verb itself is maintainer decision M1 — see the
-# module docstring; changing it is a one-line edit here.
-cli.add_command(agent_plugin)
-cli.add_command(session)
-cli.add_command(terminal)
-# Remote fleets. `cao fleet`/`cao worker` reach a cluster's worker broker over
-# HTTP; every other command here talks to the cao-server on this machine.
-cli.add_command(fleet)
-cli.add_command(worker)
-cli.add_command(workflow)
-cli.add_command(update)
-cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 
 
 if __name__ == "__main__":

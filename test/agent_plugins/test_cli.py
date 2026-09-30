@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -62,8 +63,8 @@ def run(cli_env, *args):
 class TestCommandShape:
     def test_the_group_is_registered_on_the_root_cli(self):
         """Registered and invocable — the ship gate hides it, it does not unwire it."""
-        assert "plugin" in cli.commands
-        assert cli.commands["plugin"] is agent_plugin
+        assert "plugin" in cli.list_commands(click.Context(cli))
+        assert cli.get_command(click.Context(cli), "plugin") is agent_plugin
 
         result = CliRunner().invoke(cli, ["plugin", "--help"])
         assert result.exit_code == 0
