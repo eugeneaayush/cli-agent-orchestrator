@@ -2728,6 +2728,62 @@ class TestCodexProviderTrustPrompt:
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_prompt_v3_is_waiting(self, mock_backend):
+        """Codex 0.159's "Trust this folder?" dialog is WAITING_USER_ANSWER, not IDLE.
+
+        Misreading it as IDLE let a queued task be typed into the dialog; the
+        Enter then accepted trust and the task text was lost.
+        """
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = load_fixture("codex_trust_prompt_v3.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_v3_detected_and_accepted(
+        self, mock_backend, mock_error, _mock_sleep
+    ):
+        mock_backend.return_value.get_history.side_effect = [
+            load_fixture("codex_trust_prompt_v3.txt"),
+            "OpenAI Codex (v0.159.0)\n"
+            "› Ask Codex to do anything\n\n"
+            "  glm-5.3 high · ~/project\n",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+        mock_error.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_v3_question_in_scrollback_does_not_false_positive(self, mock_backend):
+        """The v3 question quoted in an earlier reply, with no live footer, stays idle."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "› what does codex ask in a new folder?\n"
+            '• It shows "Trust this folder?" and a two-item menu.\n'
+            + "".join(f"• detail line {n}.\n" for n in range(16))
+            + "\n› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_trust_v2_in_scrollback_does_not_false_positive(self, mock_backend):
         """V2 trust text in scrollback (not bottom) must NOT trigger WAITING."""
         mock_backend.return_value.get_pane_current_command.return_value = "codex"
