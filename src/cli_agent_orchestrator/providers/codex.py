@@ -7,7 +7,10 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
@@ -99,13 +102,18 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[
 TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
-# Two known variants:
+# Three known variants:
 #   v0.98+: "allow Codex to work in this folder"
 #   v0.130+ (git worktree): "Do you trust the contents of this directory?"
-# Both indicate the TUI is blocked waiting for user input.
+#   v0.159+: "Folder access" / "Trust this folder? ..." / "› 1. Trust and continue"
+#            / "2. Quit" with an "enter continue · esc quit" footer
+# All indicate the TUI is blocked waiting for user input; Enter accepts the
+# highlighted default (trust) in each.
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
 TRUST_PROMPT_FOOTER = r"Press enter to continue"
+TRUST_PROMPT_PATTERN_V3 = r"Trust this folder\?"
+TRUST_PROMPT_FOOTER_V3 = r"enter continue\s*·\s*esc quit"
 
 # First-run auth menu, shown when no OpenAI/Codex credentials are configured yet:
 #   Welcome to Codex, OpenAI's command-line coding agent
@@ -438,6 +446,25 @@ def _toml_override(key: str, value: Any) -> str:
         return f"{key}={_toml_scalar(value)}"
     except TypeError as exc:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
+
+
+def _has_trust_dialog_in_bottom(bottom_region: str) -> bool:
+    """True when a v2 or v3 workspace trust dialog is on screen.
+
+    Both the question AND its footer must appear in the bottom region, so the
+    question text surviving in scrollback (e.g. inside a model reply) does not
+    count as a live dialog.
+    """
+    return bool(
+        (
+            re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
+            and re.search(TRUST_PROMPT_FOOTER, bottom_region)
+        )
+        or (
+            re.search(TRUST_PROMPT_PATTERN_V3, bottom_region)
+            and re.search(TRUST_PROMPT_FOOTER_V3, bottom_region)
+        )
+    )
 
 
 def _has_update_dialog_in_bottom(clean_output: str) -> bool:
@@ -867,6 +894,31 @@ class CodexProvider(BaseProvider):
         """
         return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
 
+    @staticmethod
+    def _resolve_codex_home(profile: Optional["AgentProfile"]) -> Optional[Path]:
+        """Return the profile's ``codexHome`` as a validated path, or None.
+
+        The directory becomes ``CODEX_HOME`` for this terminal's codex process:
+        its own config.toml (model provider, model, MCP servers), auth and
+        sessions, independent of the user's ~/.codex. Fails closed -- a
+        configured-but-unusable directory raises ProviderError instead of
+        silently launching against ~/.codex, whose config and login belong to
+        the user's own Codex setup.
+        """
+        raw = getattr(profile, "codexHome", None) if profile is not None else None
+        # AgentProfile types this Optional[str] (min_length=1), so anything else
+        # can only be an unvalidated stand-in object; treat it as unset.
+        if not isinstance(raw, str):
+            return None
+        if not raw.strip():
+            raise ProviderError("codexHome must be a non-empty path string")
+        codex_home = Path(raw).expanduser()
+        if not codex_home.is_absolute():
+            raise ProviderError(f"codexHome must be an absolute path (or start with ~): {raw!r}")
+        if not codex_home.is_dir():
+            raise ProviderError(f"codexHome does not exist or is not a directory: {codex_home}")
+        return codex_home
+
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -876,8 +928,9 @@ class CodexProvider(BaseProvider):
         # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
         # is the default because CAO runs codex non-interactively in tmux
         # where approval prompts would block handoff/assign. Profiles can
-        # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # opt out via `codexProfile` (a Codex config profile, read by Codex
+        # 0.134+ from $CODEX_HOME/<name>.config.toml), unless unrestricted
+        # allowed tools are enabled.
         # In practice, allowed_tools containing "*" is treated as yolo mode
         # and overrides codexProfile in the same way as an explicit yolo launch.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
@@ -888,6 +941,10 @@ class CodexProvider(BaseProvider):
                 profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        # Validated before anything else is built so an unusable codexHome fails
+        # the launch instead of falling back to ~/.codex.
+        codex_home = self._resolve_codex_home(profile)
 
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
@@ -919,7 +976,7 @@ class CodexProvider(BaseProvider):
                     "settings in ~/.codex/config.toml, including "
                     "[sandbox_workspace_write].network_access, do NOT apply. Set "
                     "codexProfile on the agent profile to launch under a named "
-                    "[profiles.<name>] block instead.",
+                    "Codex config profile instead.",
                     self.terminal_id,
                 )
             command_parts = ["codex", "--yolo"]
@@ -1116,6 +1173,11 @@ class CodexProvider(BaseProvider):
         command = shlex.join(command_parts)
         if developer_instructions_fragment is not None:
             command = f"{command} {developer_instructions_fragment}"
+        if codex_home is not None:
+            # Scoped to this one codex process via a command-prefix assignment
+            # (CODEX_* keys are deliberately not forwardable through tmux env).
+            # A path, never a secret, so it is safe on the typed launch line.
+            command = f"CODEX_HOME={shlex.quote(str(codex_home))} {command}"
         return command
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
@@ -1157,14 +1219,10 @@ class CodexProvider(BaseProvider):
 
             bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
 
-            if (
-                not trust_dismissed
-                and re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
-                and re.search(TRUST_PROMPT_FOOTER, bottom_region)
-            ):
+            if not trust_dismissed and _has_trust_dialog_in_bottom(bottom_region):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                logger.info("Codex workspace trust prompt (v2) detected, auto-accepting")
+                logger.info("Codex workspace trust prompt (v2/v3) detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 trust_dismissed = True
@@ -1192,10 +1250,7 @@ class CodexProvider(BaseProvider):
             has_idle = _has_startup_idle_composer(clean_output)
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
-                or (
-                    re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
-                    and re.search(TRUST_PROMPT_FOOTER, bottom_region)
-                )
+                or _has_trust_dialog_in_bottom(bottom_region)
                 or _has_update_dialog_in_bottom(clean_output)
             )
             if has_idle and not has_dialog:
@@ -1344,14 +1399,14 @@ class CodexProvider(BaseProvider):
         if re.search(TRUST_PROMPT_PATTERN, clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # V2 trust dialog ("Do you trust the contents of this directory?" / "Press enter
-        # to continue"). Only classify as WAITING when BOTH the question AND the footer
+        # V2/V3 trust dialogs ("Do you trust the contents of this directory?" / "Press
+        # enter to continue", or Codex 0.159+'s "Trust this folder?" / "enter continue ·
+        # esc quit"). Only classify as WAITING when BOTH the question AND the footer
         # appear in the bottom region — avoids false positives if the question text
-        # appears in scrollback from a previous model response.
+        # appears in scrollback from a previous model response. Misreading the v3 dialog
+        # as IDLE let a queued task be typed into it and lost (the Enter accepted trust).
         bottom_region = "\n".join(clean_output.splitlines()[-15:])
-        if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) and re.search(
-            TRUST_PROMPT_FOOTER, bottom_region
-        ):
+        if _has_trust_dialog_in_bottom(bottom_region):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Update-available dialog. Bottom-anchored like trust-v2 to avoid false

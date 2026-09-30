@@ -79,12 +79,20 @@ class AgentProfile(BaseModel):
     permissionMode: Optional[PermissionMode] = None
     native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
 
-    # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
-    # Used as --profile <name> when yolo mode is not active; unrestricted
-    # allowed tools still force --yolo. min_length=1 prevents an explicit
-    # empty string from silently degrading to --yolo, since this is a
-    # permission-floor knob.
+    # Codex-only. Names a Codex config profile, passed as --profile <name> when
+    # yolo mode is not active; unrestricted allowed tools still force --yolo.
+    # Codex 0.134+ reads it from $CODEX_HOME/<name>.config.toml (older Codex
+    # read a [profiles.<name>] table in config.toml, which newer Codex rejects).
+    # min_length=1 prevents an explicit empty string from silently degrading to
+    # --yolo, since this is a permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Codex-only. A directory used as CODEX_HOME for this agent's codex process
+    # (its own config.toml, auth and sessions), e.g. a worker on a different
+    # model provider or account than the user's own ~/.codex. Must be an
+    # existing absolute path (~ is expanded); an unusable value fails the
+    # launch rather than falling back to ~/.codex.
+    codexHome: Optional[str] = Field(default=None, min_length=1)
 
     # Codex-only. Inline Codex config overrides passed as `-c key=value` at
     # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",
@@ -108,7 +116,10 @@ class AgentProfile(BaseModel):
     # profile set per-agent reasoning effort without relying on the
     # machine-global `effortLevel` in ~/.claude/settings.json. This is the
     # Claude analog of codexConfig for the codex provider; the top-level
-    # `model` field still maps to `--model`.
+    # `model` field still maps to `--model`. {"configDir": "<dir>"} runs the
+    # agent with CLAUDE_CONFIG_DIR=<dir> (its own settings, .claude.json and
+    # credentials); it must be an existing absolute path (~ is expanded), and
+    # an unusable value fails the launch rather than falling back to ~/.claude.
     claudeConfig: Optional[Dict[str, Any]] = None
 
     # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal

@@ -32,7 +32,13 @@ cao shutdown --session <session-name>
 
 ## Forwarding env vars to spawned agents
 
-By default, only a tight allowlist of env vars (`HOME`, `PATH`, `SHELL`, plus `CAO_*` / `KIRO_*` / `MISE_*` / `AWS_*` prefixes) reaches agents spawned inside tmux. The filter keeps the `tmux new-session -e` argv under the kernel limit and prevents nested-session loops when CAO itself runs inside a provider.
+By default, CAO passes only a tight allowlist of env vars (`HOME`, `PATH`, `SHELL`, plus `CAO_*` / `KIRO_*` / `MISE_*` / `AWS_*` prefixes) to new sessions with `tmux new-session -e`. The filter keeps that argv under the kernel limit and prevents nested-session loops when CAO itself runs inside a provider.
+
+The allowlist is not isolation. Every pane also inherits the tmux server's **global** environment, which is the full environment of whichever process first started the tmux server on the default socket. When `cao-server` starts it, that is `cao-server`'s own environment. Start `cao-server` from a clean environment (for example a launchd or systemd service), not from a shell spawned by an agent session. Otherwise variables such as `ANTHROPIC_BASE_URL`, API keys or `CLAUDECODE` reach every agent. The global environment outlives `cao-server` restarts until `tmux kill-server`. Check it with:
+
+```bash
+tmux show-environment -g | cut -d= -f1
+```
 
 To forward additional vars to **the supervisor and every worker spawned later in the same session** (via `assign` / `handoff` / the web UI), pass `--env KEY=VALUE` to `cao launch`:
 

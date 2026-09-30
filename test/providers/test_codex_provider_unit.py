@@ -1044,6 +1044,115 @@ class TestCodexProviderCodexConfig:
         assert 'model_reasoning_effort="xhigh"' in command
 
 
+class TestCodexProviderCodexHome:
+    """profile.codexHome -> per-process CODEX_HOME, failing closed."""
+
+    @staticmethod
+    def _profile(codex_home, **overrides):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        fields = {"name": "zai-codex", "description": "d", "codexHome": str(codex_home)}
+        fields.update(overrides)
+        return AgentProfile(**fields)
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_prefixes_codex_home_in_yolo_path(self, mock_load, tmp_path):
+        home = tmp_path / "codex zai"  # space: exercises quoting
+        home.mkdir()
+        mock_load.return_value = self._profile(home)
+
+        command = CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+        words = shlex.split(command)
+        assert words[:3] == [f"CODEX_HOME={home}", "codex", "--yolo"]
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_prefixes_codex_home_in_profile_path(self, mock_load, tmp_path):
+        home = tmp_path / "codex-zai"
+        home.mkdir()
+        mock_load.return_value = self._profile(home, codexProfile="zai")
+
+        command = CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+        assert shlex.split(command)[:4] == [f"CODEX_HOME={home}", "codex", "--profile", "zai"]
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_developer_instructions_fragment_still_last(self, mock_load, tmp_path):
+        home = tmp_path / "codex-zai"
+        home.mkdir()
+        mock_load.return_value = self._profile(home, system_prompt="You are a GLM worker.")
+
+        provider = CodexProvider("tid-home", "sess", "win", "zai-codex")
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
+
+        assert command.startswith(f"CODEX_HOME={shlex.quote(str(home))} codex --yolo ")
+        assert command.endswith(
+            f'-c "developer_instructions=$(cat {shlex.quote(str(tmp_path / "tmp" / "tid-home.codex_developer_instructions"))})"'
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_tilde_is_expanded(self, mock_load, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".codex-zai").mkdir()
+        mock_load.return_value = self._profile("~/.codex-zai")
+
+        command = CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+        assert shlex.split(command)[0] == f"CODEX_HOME={tmp_path / '.codex-zai'}"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_no_codex_home_means_no_prefix(self, mock_load):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        mock_load.return_value = AgentProfile(name="plain", description="d")
+
+        command = CodexProvider("tid", "sess", "win", "plain")._build_codex_command()
+
+        assert "CODEX_HOME" not in command
+        assert command.startswith("codex --yolo ")
+
+    @pytest.mark.parametrize(
+        "value, match",
+        [
+            ("relative/dir", "absolute path"),
+            ("   ", "non-empty path string"),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_invalid_values_fail_closed(self, mock_load, value, match):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        mock_load.return_value = AgentProfile(name="zai-codex", description="d", codexHome=value)
+
+        with pytest.raises(ProviderError, match=match):
+            CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_missing_directory_fails_closed(self, mock_load, tmp_path):
+        mock_load.return_value = self._profile(tmp_path / "missing")
+
+        with pytest.raises(ProviderError, match="does not exist"):
+            CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_file_instead_of_directory_fails_closed(self, mock_load, tmp_path):
+        not_a_dir = tmp_path / "config.toml"
+        not_a_dir.write_text("")
+        mock_load.return_value = self._profile(not_a_dir)
+
+        with pytest.raises(ProviderError, match="not a directory"):
+            CodexProvider("tid", "sess", "win", "zai-codex")._build_codex_command()
+
+    def test_empty_codex_home_rejected_by_profile_model(self):
+        from pydantic import ValidationError
+
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        with pytest.raises(ValidationError):
+            AgentProfile(name="zai-codex", description="d", codexHome="")
+
+
 class TestCodexProviderStatusDetection:
     def test_get_status_idle(self):
         output = load_fixture("codex_idle_output.txt")
@@ -2617,6 +2726,62 @@ class TestCodexProviderTrustPrompt:
         status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_prompt_v3_is_waiting(self, mock_backend):
+        """Codex 0.159's "Trust this folder?" dialog is WAITING_USER_ANSWER, not IDLE.
+
+        Misreading it as IDLE let a queued task be typed into the dialog; the
+        Enter then accepted trust and the task text was lost.
+        """
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = load_fixture("codex_trust_prompt_v3.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_v3_detected_and_accepted(
+        self, mock_backend, mock_error, _mock_sleep
+    ):
+        mock_backend.return_value.get_history.side_effect = [
+            load_fixture("codex_trust_prompt_v3.txt"),
+            "OpenAI Codex (v0.159.0)\n"
+            "› Ask Codex to do anything\n\n"
+            "  glm-5.3 high · ~/project\n",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+        mock_error.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_v3_question_in_scrollback_does_not_false_positive(self, mock_backend):
+        """The v3 question quoted in an earlier reply, with no live footer, stays idle."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "› what does codex ask in a new folder?\n"
+            '• It shows "Trust this folder?" and a two-item menu.\n'
+            + "".join(f"• detail line {n}.\n" for n in range(16))
+            + "\n› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_trust_v2_in_scrollback_does_not_false_positive(self, mock_backend):

@@ -149,7 +149,7 @@ By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-
 >
 > To actually contain a Codex worker:
 >
-> - **`codexProfile`** drops `--yolo`, so your named `[profiles.<name>]` block governs sandbox and
+> - **`codexProfile`** drops `--yolo`, so your named Codex config profile governs sandbox and
 >   approvals. Note that `allowedTools: ["*"]` overrides it and forces `--yolo`; CAO logs a
 >   warning when that happens, so the discard is not silent.
 > - **`use_worktree=true`** puts writes in a throwaway git worktree behind review instead of the
@@ -157,7 +157,9 @@ By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-
 
 ### Custom Codex Profile
 
-The `codexProfile` field on an agent profile names a `[profiles.<name>]` block in your `~/.codex/config.toml`. When set, CAO drops `--yolo` and passes `--profile <name>` instead, letting the user's named profile govern sandbox and approval behavior. Unrestricted allowed tools (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) override this field and always force `--yolo`.
+The `codexProfile` field on an agent profile names a Codex config profile. When set, CAO drops `--yolo` and passes `--profile <name>` instead, letting the named profile govern sandbox and approval behavior. Unrestricted allowed tools (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) override this field and always force `--yolo`.
+
+Codex 0.134 and later read `--profile <name>` from a separate file, `$CODEX_HOME/<name>.config.toml` (by default `~/.codex/<name>.config.toml`), layered on top of `config.toml`. Older Codex read a `[profiles.<name>]` table inside `config.toml`. Current Codex no longer reads that table, and rejects `--profile <name>` when a legacy table of the same name is still present, so move the settings into the per-profile file. A missing profile file loads as empty, without an error, so double-check the file name.
 
 **Important — non-interactive only**: CAO's status detector cannot interact with Codex's current boxed approval UI (`Command Approval Required / [a] Accept / [d] Decline`). Any `codexProfile` you reference MUST resolve to a non-interactive permission tier, or CAO sessions will time out waiting for input that nothing can deliver. Safe shapes:
 
@@ -181,10 +183,9 @@ codexProfile: cao_reviewer
 You review code for quality and correctness.
 ```
 
-Matching `~/.codex/config.toml`:
+Matching `~/.codex/cao_reviewer.config.toml` (Codex 0.134+):
 
 ```toml
-[profiles.cao_reviewer]
 sandbox_mode = "read-only"
 approval_policy = "never"
 ```
@@ -217,6 +218,52 @@ You implement backend changes from a task spec.
 ```
 
 This launches Codex as `codex --yolo … -c model_reasoning_effort="xhigh" -c service_tier="fast" -c features.fast_mode=true`, applying the effort and fast-mode settings to that agent only.
+
+### Per-Agent Codex Home
+
+The `codexHome` field runs an agent's `codex` process with its own `CODEX_HOME`: its own `config.toml`, credentials, sessions and skills, independent of the `~/.codex` that you (and the Codex desktop app) use. CAO launches it as `CODEX_HOME=<dir> codex …`.
+
+Use it for a worker that should run on a different model provider or account, without adding that provider to your own `~/.codex/config.toml`:
+
+```markdown
+---
+name: glm-codex-developer
+description: Codex worker on a custom model provider
+provider: codex
+model: glm-5.3
+codexHome: ~/.codex-glm
+---
+
+You implement the task you are given.
+```
+
+With `~/.codex-glm/config.toml` along these lines (see Codex's custom model provider documentation):
+
+```toml
+model = "glm-5.3"
+model_provider = "ZAI"
+model_catalog_json = "/Users/you/.codex-glm/models.json"
+
+[model_providers.ZAI]
+name = "Z.ai"
+base_url = "https://api.z.ai/api/v1"
+wire_api = "responses"
+
+# Codex runs this command to get the bearer token, so no key is stored in the file.
+[model_providers.ZAI.auth]
+command = "/usr/bin/security"
+args = ["find-generic-password", "-a", "you", "-s", "zai-coding-plan", "-w"]
+```
+
+Behavior:
+
+- **Fails closed.** The value must be an existing directory and an absolute path (`~` is expanded). Otherwise the launch fails with a provider error. It never falls back to `~/.codex`.
+- **Scoped to the codex process.** `CODEX_*` variables are deliberately not forwardable through the tmux session environment, so the variable is set as a prefix on the launch line. Children of the worker inherit it.
+- `codexProfile` files and `codexConfig` overrides resolve against this directory as usual.
+- Codex does not load your `~/.codex/config.toml` MCP servers, notify hooks or desktop-app extensions in this home, which also shortens worker startup.
+- Never put secrets, or `${VAR}` placeholders that resolve to secrets, in `codexConfig`: overrides are typed into the tmux pane and land in the terminal log. Use the provider's `auth` command or `env_key` instead.
+
+See [examples/zai-glm-workers](../examples/zai-glm-workers/README.md) for a complete setup.
 
 ## Workflows
 

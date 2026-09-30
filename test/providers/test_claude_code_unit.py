@@ -1758,6 +1758,263 @@ class TestClaudeCodeProviderClaudeConfig:
         assert "--effort" not in command
 
 
+def _config_dir_profile(config_dir, **overrides) -> AgentProfile:
+    """A real AgentProfile carrying claudeConfig.configDir (plus overrides)."""
+    fields = {
+        "name": "zai-agent",
+        "description": "d",
+        "claudeConfig": {"configDir": str(config_dir)},
+    }
+    fields.update(overrides)
+    return AgentProfile(**fields)
+
+
+def _launch_env(command: str, pane_env: dict) -> dict:
+    """Run the launch line's shell prefix with `env` in place of `claude`.
+
+    Returns the environment the claude process would actually see, so tests
+    exercise the real `unset` + `CLAUDE_CONFIG_DIR=` behaviour in a shell rather
+    than asserting on substrings.
+    """
+    import subprocess
+
+    unset_cmd, rest = command.split("; ", 1)
+    words = shlex.split(rest)
+    assignments = [w.split("=", 1) for w in words[: words.index("claude")]]
+    prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in assignments)
+    probe = f"{unset_cmd}; {prefix} env"
+    out = subprocess.run(
+        ["/bin/sh", "-c", probe],
+        env={"PATH": "/usr/bin:/bin", **pane_env},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+class TestClaudeCodeProviderConfigDir:
+    """claudeConfig.configDir -> per-terminal CLAUDE_CONFIG_DIR, failing closed."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_sets_config_dir_after_the_unset(self, mock_load, tmp_path):
+        config_dir = tmp_path / "claude-zai"
+        config_dir.mkdir()
+        mock_load.return_value = _config_dir_profile(config_dir)
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        unset_part, launch_part = command.split("; ", 1)
+        assert unset_part.startswith("unset ")
+        assert launch_part.startswith(f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} claude ")
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_config_dir_survives_the_unset_in_a_real_shell(self, mock_load, tmp_path):
+        """The pane may carry a stale CLAUDE_CONFIG_DIR (and Desktop-leaked
+        CLAUDE_* vars); the launched process must see only the profile's dir."""
+        config_dir = tmp_path / "claude zai"  # space: exercises quoting
+        config_dir.mkdir()
+        mock_load.return_value = _config_dir_profile(config_dir)
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        env = _launch_env(
+            command,
+            {"CLAUDE_CONFIG_DIR": "/wrong", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"},
+        )
+        assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+        assert "CLAUDE_CODE_ENTRYPOINT" not in env
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_tilde_is_expanded(self, mock_load, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".claude-zai").mkdir()
+        mock_load.return_value = _config_dir_profile("~/.claude-zai")
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        assert f"CLAUDE_CONFIG_DIR={shlex.quote(str(tmp_path / '.claude-zai'))} claude" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_applies_on_native_agent_route(self, mock_load, tmp_path):
+        config_dir = tmp_path / "claude-zai"
+        config_dir.mkdir()
+        mock_load.return_value = _config_dir_profile(config_dir, native_agent="builder")
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        command = provider._build_claude_command()
+
+        assert "--agent builder" in command
+        assert f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} claude" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_container_path_is_translated(self, mock_load, tmp_path):
+        config_dir = tmp_path / "claude-zai"
+        config_dir.mkdir()
+        mock_load.return_value = _config_dir_profile(
+            config_dir,
+            container=ContainerConfig(
+                path_maps=[ContainerPathMap(host=str(tmp_path), guest="/app/config")]
+            ),
+        )
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        assert "CLAUDE_CONFIG_DIR=/app/config/claude-zai claude" in command
+        assert f"CLAUDE_CONFIG_DIR={tmp_path}" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_no_config_dir_means_no_prefix(self, mock_load):
+        mock_load.return_value = AgentProfile(
+            name="plain", description="d", claudeConfig={"effort": "high"}
+        )
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "plain")
+        command = provider._build_claude_command()
+
+        assert "CLAUDE_CONFIG_DIR" not in command
+
+    @pytest.mark.parametrize(
+        "value, match",
+        [
+            ("relative/dir", "absolute path"),
+            ("", "non-empty path string"),
+            (42, "non-empty path string"),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_invalid_values_fail_closed(self, mock_load, value, match):
+        mock_load.return_value = AgentProfile(
+            name="zai-agent", description="d", claudeConfig={"configDir": value}
+        )
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with pytest.raises(ProviderError, match=match):
+            provider._build_claude_command()
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_missing_directory_fails_closed(self, mock_load, tmp_path):
+        mock_load.return_value = _config_dir_profile(tmp_path / "does-not-exist")
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with pytest.raises(ProviderError, match="does not exist"):
+            provider._build_claude_command()
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_file_instead_of_directory_fails_closed(self, mock_load, tmp_path):
+        not_a_dir = tmp_path / "settings.json"
+        not_a_dir.write_text("{}")
+        mock_load.return_value = _config_dir_profile(not_a_dir)
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with pytest.raises(ProviderError, match="not a directory"):
+            provider._build_claude_command()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    async def test_initialize_fails_closed_before_touching_the_pane(
+        self, mock_load, mock_backend, mock_wait_shell, tmp_path
+    ):
+        mock_load.return_value = _config_dir_profile(tmp_path / "missing")
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with (
+            patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting") as mock_ensure,
+            pytest.raises(ProviderError, match="does not exist"),
+        ):
+            await provider.initialize()
+
+        mock_wait_shell.assert_not_called()
+        mock_ensure.assert_not_called()
+        mock_backend.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    async def test_initialize_writes_bypass_setting_into_config_dir(
+        self, mock_load, mock_backend, mock_wait_status, mock_wait_shell, tmp_path
+    ):
+        config_dir = tmp_path / "claude-zai"
+        config_dir.mkdir()
+        mock_load.return_value = _config_dir_profile(config_dir)
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = "Welcome to Claude Code v2.1"
+
+        provider = ClaudeCodeProvider("test-cfg", "sess", "win", "zai-agent")
+        with (
+            patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path),
+            patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting") as mock_ensure,
+            patch.object(provider, "get_status", return_value=TerminalStatus.IDLE),
+        ):
+            await provider.initialize()
+
+        mock_ensure.assert_called_once_with(config_dir / "settings.json")
+
+    def test_bypass_setting_writes_only_the_given_settings_file(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        settings_file = tmp_path / "claude-zai" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_text(json.dumps({"apiKeyHelper": "/usr/bin/true"}))
+
+        ClaudeCodeProvider._ensure_skip_bypass_prompt_setting(settings_file)
+
+        result = json.loads(settings_file.read_text())
+        assert result == {
+            "apiKeyHelper": "/usr/bin/true",
+            "skipDangerousModePermissionPrompt": True,
+        }
+        assert not (home / ".claude").exists()
+
+
+class TestClaudeCodeLaunchEnvScrub:
+    """The launch line's `unset CLAUDE*` is load-bearing for credential
+    isolation: host-orchestration vars leaked from a Claude Desktop-spawned
+    shell make Claude Code ignore settings-based credentials. Pin it."""
+
+    def test_scrubs_desktop_and_session_vars_but_keeps_provider_auth_flags(self):
+        provider = ClaudeCodeProvider("test-scrub", "sess", "win")
+        command = provider._build_claude_command()
+
+        env = _launch_env(
+            command,
+            {
+                "CLAUDECODE": "1",
+                "CLAUDE_CODE_ENTRYPOINT": "claude-desktop",
+                "CLAUDE_CODE_REMOTE": "1",
+                "CLAUDE_CODE_OAUTH_TOKEN": "x",
+                "CLAUDE_CONFIG_DIR": "/somewhere",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_EFFORT_LEVEL": "high",
+            },
+        )
+
+        for scrubbed in (
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_REMOTE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ):
+            assert scrubbed not in env, scrubbed
+        assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+        assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "high"
+
+
 class TestClaudeCodeProviderPermissionMode:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
