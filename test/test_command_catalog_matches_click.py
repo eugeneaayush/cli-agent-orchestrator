@@ -59,13 +59,20 @@ def _click_leaves() -> set[str]:
     Walks the command tree programmatically — never ``--help`` output. Help-scraping cannot
     see a parameter's type (``--agents`` is declared Click ``TEXT``, not ``Choice``), which is
     why the superseded TUI could not offer a picker, and it is a mandated prohibition.
+
+    Goes through ``list_commands``/``get_command``, the way Click itself resolves commands,
+    not ``Group.commands``: the root group registers its subcommands lazily
+    (``cli/lazy_group.py``), so its ``commands`` dict is empty until each one is used.
     """
     from cli_agent_orchestrator.cli.main import cli
 
     def walk(command: click.Command, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
         if isinstance(command, click.Group):
+            ctx = click.Context(command)
             found: list[tuple[str, ...]] = []
-            for name, sub in command.commands.items():
+            for name in command.list_commands(ctx):
+                sub = command.get_command(ctx, name)
+                assert sub is not None, f"{' '.join(path + (name,))} is listed but not resolvable"
                 found.extend(walk(sub, path + (name,)))
             return found
         return [path]

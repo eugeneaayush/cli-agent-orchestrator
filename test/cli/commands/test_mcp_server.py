@@ -11,7 +11,7 @@ def test_mcp_server_command():
     """Test that mcp-server command calls run_mcp_server."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.mcp_server.run_mcp_server") as mock_run:
+    with patch("cli_agent_orchestrator.mcp_server.server.main") as mock_run:
         result = runner.invoke(mcp_server)
 
         assert result.exit_code == 0

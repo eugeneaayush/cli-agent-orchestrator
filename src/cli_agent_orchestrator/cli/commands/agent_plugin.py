@@ -134,7 +134,8 @@ def _echo_affected(affected: List[AffectedSession]) -> None:
 # text leaves dispatch untouched and every subcommand still ran. Click has no
 # built-in "disabled group", so the callback — which Click invokes before any
 # subcommand — is the mechanism. When M1 lands, ``hidden`` flips and the gate's
-# default flips; they are independent decisions.
+# default flips; they are independent decisions. ``hidden`` is mirrored in
+# ``cli/main.py``'s ``_COMMANDS``, which lists commands without importing them.
 @click.group("plugin", hidden=True)
 def agent_plugin() -> None:
     """Manage agent plugins (Agent Plugins 1.0.0).
